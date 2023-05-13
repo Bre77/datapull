@@ -1,11 +1,18 @@
 import os
 import sys
+import csv
 import time
 import requests
-import csv
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
 from splunklib.modularinput import *
+
+sys.path.append(
+    os.path.join(os.environ["SPLUNK_HOME"], "etc", "apps", "SA-VSCode", "bin")
+)
+import splunk_debug as dbg
+
+dbg.enable_debugging(timeout=25)
 
 
 class Input(Script):
@@ -13,7 +20,7 @@ class Input(Script):
     APP = "datapull"
 
     def get_scheme(self):
-        scheme = Scheme("Data Pull (Double)")
+        scheme = Scheme("Data Pull")
         scheme.description = "Index data from a Splunk Search Head. Put the target index name as the input name"
         scheme.use_external_validation = False
         scheme.streaming_mode_xml = True
@@ -50,7 +57,7 @@ class Input(Script):
             Argument(
                 name="earliest",
                 title="Earliest",
-                data_type=Argument.data_type_string,
+                data_type=Argument.data_type_number,
                 required_on_create=True,
                 required_on_edit=False,
             )
@@ -59,7 +66,7 @@ class Input(Script):
             Argument(
                 name="latest",
                 title="Latest",
-                data_type=Argument.data_type_string,
+                data_type=Argument.data_type_number,
                 required_on_create=True,
                 required_on_edit=False,
             )
@@ -68,7 +75,6 @@ class Input(Script):
         return scheme
 
     def stream_events(self, inputs, ew):
-        global killer
         self.service.namespace["app"] = self.APP
         # Get Variables
         input_name, input_items = inputs.inputs.popitem()
@@ -123,57 +129,54 @@ class Input(Script):
         except:
             earliest = start
 
-        prev = None
         with requests.Session() as s:
             s.headers.update({"Authorization": f"Splunk {auth['authtoken']}"})
+
             # Do the logic
-            while True:
-                if earliest < end:
-                    latest = min(earliest + 86400, end)
-                    ew.log(
-                        EventWriter.INFO,
-                        f"status=search name={name} earliest={earliest} latest={latest} start={start} end={end}",
-                    )
-                    next = s.post(
-                        url,
-                        stream=True,
-                        data={
-                            "search": f"search index={name}",
-                            "earliest_time": earliest,
-                            "latest_time": latest,
-                            "enable_lookups": False,
-                            "output_mode": "csv",
-                            "exec_mode": "oneshot",
-                            "time_format": "%s",
-                            "adhoc_search_level": "fast",
-                            "f": [
-                                "_time",
-                                "host",
-                                "source",
-                                "sourcetype",
-                                "_raw",
-                            ],
-                        },
-                    )
-                if prev:
-                    if prev.status_code != requests.codes.ok:
+            while earliest < end:
+                latest = min(earliest + 86400, end)
+                ew.log(
+                    EventWriter.INFO,
+                    f"status=search name={name} earliest={earliest} latest={latest} start={start} end={end}",
+                )
+                with s.post(
+                    url,
+                    stream=True,
+                    data={
+                        "search": f"search index={name}",
+                        "earliest_time": earliest,
+                        "latest_time": latest,
+                        "enable_lookups": False,
+                        "output_mode": "csv",
+                        "exec_mode": "oneshot",
+                        "time_format": "%s",
+                        "adhoc_search_level": "fast",
+                        "f": [
+                            "_time",
+                            "host",
+                            "source",
+                            "sourcetype",
+                            "_raw",
+                        ],
+                    },
+                ) as r:
+                    if r.status_code != requests.codes.ok:
                         ew.log(
                             EventWriter.ERROR,
-                            f"status=error name={name} response={prev.text}",
+                            f"status=error name={name} response={r.status_code}",
                         )
                         time.sleep(1)
                         input.disable()
-                        break
+                        sys.exit()
                     count = 0
-                    reader = csv.reader(
-                        prev.iter_lines(decode_unicode=True),
+                    for row in csv.DictReader(
+                        r.iter_lines(decode_unicode=True),
                         delimiter=",",
                         quotechar='"',
-                    )
-                    for row in reader:
+                    ):
                         ew.write_event(
                             Event(
-                                index=input_name,
+                                index=name,
                                 time=row["_time"],
                                 host=row["host"],
                                 source=row["source"],
@@ -185,22 +188,16 @@ class Input(Script):
                         if count % MOD == 0:
                             ew.log(
                                 EventWriter.INFO,
-                                f"status=progress progress={MOD} name={name} current={data['result']['_time']}",
+                                f"status=progress progress={MOD} name={name} current={row['_time']} earliest={earliest} latest={latest} start={start} end={end}",
                             )
-                    # Save Progress (prev ends where next started)
-                    open(checkpointfile, "w").write(str(earliest))
-
                     ew.log(
                         EventWriter.INFO,
-                        f"status=done total={count} progress={count % MOD} name={name}",
+                        f"status=done total={count} progress={count % MOD} name={name} earliest={earliest} latest={latest} start={start} end={end}",
                     )
 
-                if not next:
-                    break
-
+                # Save Progress
                 earliest = latest
-                prev = next
-                next = None
+                open(checkpointfile, "w").write(str(earliest))
 
 
 if __name__ == "__main__":

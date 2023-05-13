@@ -1,6 +1,6 @@
 import os
 import sys
-import json
+import csv
 import time
 import requests
 
@@ -50,7 +50,7 @@ class Input(Script):
             Argument(
                 name="earliest",
                 title="Earliest",
-                data_type=Argument.data_type_string,
+                data_type=Argument.data_type_number,
                 required_on_create=True,
                 required_on_edit=False,
             )
@@ -59,7 +59,7 @@ class Input(Script):
             Argument(
                 name="latest",
                 title="Latest",
-                data_type=Argument.data_type_string,
+                data_type=Argument.data_type_number,
                 required_on_create=True,
                 required_on_edit=False,
             )
@@ -68,7 +68,6 @@ class Input(Script):
         return scheme
 
     def stream_events(self, inputs, ew):
-        global killer
         self.service.namespace["app"] = self.APP
         # Get Variables
         input_name, input_items = inputs.inputs.popitem()
@@ -141,7 +140,7 @@ class Input(Script):
                         "earliest_time": earliest,
                         "latest_time": latest,
                         "enable_lookups": False,
-                        "output_mode": "json",
+                        "output_mode": "csv",
                         "exec_mode": "oneshot",
                         "time_format": "%s",
                         "adhoc_search_level": "fast",
@@ -157,31 +156,44 @@ class Input(Script):
                     if r.status_code != requests.codes.ok:
                         ew.log(
                             EventWriter.ERROR,
-                            f"status=error name={name} response={r.text}",
+                            f"status=error name={name} response={r.status_code}",
                         )
                         time.sleep(1)
                         input.disable()
+                        sys.exit()
                     count = 0
-                    for line in r.iter_lines(decode_unicode=True):
-                        if line:
-                            data = json.loads(line)
-                            if "result" in data:
-                                ew.write_event(
-                                    Event(
-                                        index=input_name,
-                                        time=data["result"]["_time"],
-                                        host=data["result"]["host"],
-                                        source=data["result"]["source"],
-                                        sourcetype=data["result"]["sourcetype"],
-                                        data=data["result"]["_raw"],
-                                    )
-                                )
-                                count += 1
-                                if count % MOD == 0:
-                                    ew.log(
-                                        EventWriter.INFO,
-                                        f"status=progress progress={MOD} name={name} current={data['result']['_time']} earliest={earliest} latest={latest} start={start} end={end}",
-                                    )
+                    rows = r.iter_lines(decode_unicode=True)
+                    for row in rows:
+                        if row != '"_time",host,source,sourcetype,"_raw"':
+                            ew.log(
+                                EventWriter.ERROR,
+                                f"status=error headers={row}",
+                            )
+                            time.sleep(1)
+                            input.disable()
+                            sys.exit()
+                        break
+                    for row in csv.reader(
+                        rows,
+                        delimiter=",",
+                        quotechar='"',
+                    ):
+                        ew.write_event(
+                            Event(
+                                index=name,
+                                time=row[0],
+                                host=row[1],
+                                source=row[2],
+                                sourcetype=row[3],
+                                data=row[4],
+                            )
+                        )
+                        count += 1
+                        if count % MOD == 0:
+                            ew.log(
+                                EventWriter.INFO,
+                                f"status=progress progress={MOD} name={name} current={row[0]} earliest={earliest} latest={latest} start={start} end={end}",
+                            )
                     ew.log(
                         EventWriter.INFO,
                         f"status=done total={count} progress={count % MOD} name={name} earliest={earliest} latest={latest} start={start} end={end}",

@@ -1,8 +1,8 @@
 import os
 import sys
+import json
 import time
 import requests
-import csv
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
 from splunklib.modularinput import *
@@ -123,7 +123,7 @@ class Input(Script):
         except:
             earliest = start
 
-        alpha = None
+        prev = None
         with requests.Session() as s:
             s.headers.update({"Authorization": f"Splunk {auth['authtoken']}"})
             # Do the logic
@@ -134,7 +134,7 @@ class Input(Script):
                         EventWriter.INFO,
                         f"status=search name={name} earliest={earliest} latest={latest} start={start} end={end}",
                     )
-                    bravo = s.post(
+                    next = s.post(
                         url,
                         stream=True,
                         data={
@@ -142,7 +142,7 @@ class Input(Script):
                             "earliest_time": earliest,
                             "latest_time": latest,
                             "enable_lookups": False,
-                            "output_mode": "csv",
+                            "output_mode": "json",
                             "exec_mode": "oneshot",
                             "time_format": "%s",
                             "adhoc_search_level": "fast",
@@ -155,48 +155,37 @@ class Input(Script):
                             ],
                         },
                     )
-                if alpha:
-                    if alpha.status_code != requests.codes.ok:
+                if prev:
+                    if prev.status_code != requests.codes.ok:
                         ew.log(
                             EventWriter.ERROR,
-                            f"status=error name={name} response={alpha.text}",
+                            f"status=error name={name} response={prev.text}",
                         )
                         time.sleep(1)
                         input.disable()
                         break
                     count = 0
-                    rows = alpha.iter_lines(decode_unicode=True)
-                    for row in rows:
-                        if row != '"_time",host,source,sourcetype,"_raw"':
-                            ew.log(
-                                EventWriter.ERROR,
-                                f"status=error headers={row}",
-                            )
-                            time.sleep(1)
-                            input.disable()
-                            sys.exit()
-                    for row in csv.reader(
-                        rows,
-                        delimiter=",",
-                        quotechar='"',
-                    ):
-                        ew.write_event(
-                            Event(
-                                index=name,
-                                time=row[0],
-                                host=row[1],
-                                source=row[2],
-                                sourcetype=row[3],
-                                data=row[4],
-                            )
-                        )
-                        count += 1
-                        if count % MOD == 0:
-                            ew.log(
-                                EventWriter.INFO,
-                                f"status=progress progress={MOD} name={name} current={row[0]}",
-                            )
-                    # Save Progress (alpha ends where next started)
+                    for line in prev.iter_lines(decode_unicode=True):
+                        if line:
+                            data = json.loads(line)
+                            if "result" in data:
+                                ew.write_event(
+                                    Event(
+                                        index=input_name,
+                                        time=data["result"]["_time"],
+                                        host=data["result"]["host"],
+                                        source=data["result"]["source"],
+                                        sourcetype=data["result"]["sourcetype"],
+                                        data=data["result"]["_raw"],
+                                    )
+                                )
+                                count += 1
+                                if count % MOD == 0:
+                                    ew.log(
+                                        EventWriter.INFO,
+                                        f"status=progress progress={MOD} name={name} current={data['result']['_time']}",
+                                    )
+                    # Save Progress (prev ends where next started)
                     open(checkpointfile, "w").write(str(earliest))
 
                     ew.log(
@@ -208,8 +197,8 @@ class Input(Script):
                     break
 
                 earliest = latest
-                alpha = bravo
-                bravo = None
+                prev = next
+                next = None
 
 
 if __name__ == "__main__":
